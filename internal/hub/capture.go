@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	captureGate       = "k8shark.io/capture-stopped"
+	captureGate       = "k8shark.io/capture-stopped" // legacy gate, removed during migration
+	captureDisabled   = "k8shark.io/capture-disabled"
 	captureStateAnno  = "k8shark.io/capture-state"
 	captureExpiryAnno = "k8shark.io/capture-expiry"
 )
@@ -50,11 +51,14 @@ type captureManager struct {
 
 type daemonSet struct {
 	Metadata struct {
-		Annotations map[string]string `json:"annotations"`
+		Annotations     map[string]string `json:"annotations"`
+		Generation      int64             `json:"generation"`
+		ResourceVersion string            `json:"resourceVersion"`
 	} `json:"metadata"`
 	Spec struct {
 		Template struct {
 			Spec struct {
+				NodeSelector    map[string]string `json:"nodeSelector"`
 				SchedulingGates []struct {
 					Name string `json:"name"`
 				} `json:"schedulingGates"`
@@ -62,6 +66,8 @@ type daemonSet struct {
 		} `json:"template"`
 	} `json:"spec"`
 	Status struct {
+		ObservedGeneration     int64 `json:"observedGeneration"`
+		NumberMisscheduled     int32 `json:"numberMisscheduled"`
 		DesiredNumberScheduled int32 `json:"desiredNumberScheduled"`
 		NumberReady            int32 `json:"numberReady"`
 		CurrentNumberScheduled int32 `json:"currentNumberScheduled"`
@@ -173,10 +179,26 @@ func (m *captureManager) reconcile(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	s := m.describe(ds, time.Now())
-	if !s.ExpiresAt.IsZero() && !s.ExpiresAt.After(time.Now()) && s.State != "stopped" {
-		if err := m.patch(ctx, ds, "stopped", nil, true); err != nil && m.logf != nil {
-			m.logf("capture session expiry cleanup failed: %v", err)
+	now := time.Now()
+	s := m.describe(ds, now)
+	stopped := ds.Metadata.Annotations[captureStateAnno] != "running" || (!s.ExpiresAt.IsZero() && !s.ExpiresAt.After(now))
+	_, disabled := ds.Spec.Template.Spec.NodeSelector[captureDisabled]
+	legacy := false
+	for _, gate := range ds.Spec.Template.Spec.SchedulingGates {
+		legacy = legacy || gate.Name == captureGate
+	}
+	// Repair legacy gates and interrupted transitions without extending sessions.
+	if legacy || (stopped && ds.Spec.Template.Spec.NodeSelector[captureDisabled] != "true") || (!stopped && disabled) || (stopped && ds.Metadata.Annotations[captureExpiryAnno] != "") {
+		state := "stopped"
+		var expiry *time.Time
+		if !stopped {
+			state = "running"
+			if !s.ExpiresAt.IsZero() {
+				expiry = &s.ExpiresAt
+			}
+		}
+		if err := m.patch(ctx, ds, state, expiry, stopped); err != nil && m.logf != nil {
+			m.logf("capture session reconciliation failed: %v", err)
 		}
 	}
 }
@@ -189,12 +211,12 @@ func (m *captureManager) describe(ds daemonSet, now time.Time) CaptureSession {
 	}
 	stopped := a[captureStateAnno] != "running" || (!s.ExpiresAt.IsZero() && !s.ExpiresAt.After(now))
 	if stopped {
-		if ds.Status.NumberReady == 0 && ds.Status.CurrentNumberScheduled == 0 {
+		if ds.Spec.Template.Spec.NodeSelector[captureDisabled] == "true" && ds.Status.ObservedGeneration >= ds.Metadata.Generation && ds.Status.DesiredNumberScheduled == 0 && ds.Status.NumberReady == 0 && ds.Status.CurrentNumberScheduled == 0 && ds.Status.NumberMisscheduled == 0 {
 			s.State = "stopped"
 		} else {
 			s.State = "stopping"
 		}
-	} else if ds.Status.DesiredNumberScheduled > 0 && ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled {
+	} else if ds.Status.ObservedGeneration >= ds.Metadata.Generation && ds.Status.DesiredNumberScheduled > 0 && ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled {
 		s.State = "running"
 	} else {
 		s.State = "starting"
@@ -229,16 +251,31 @@ func (m *captureManager) patch(ctx context.Context, ds daemonSet, state string, 
 	if expiry != nil {
 		annotations[captureExpiryAnno] = expiry.Format(time.RFC3339)
 	}
-	gates := make([]map[string]string, 0, len(ds.Spec.Template.Spec.SchedulingGates)+1)
+	// Merge only our reserved selector key; all other scheduling settings stay
+	// Git-owned. A null value removes only this key on start.
+	var disabled any
+	if stopped {
+		disabled = "true"
+	}
+	podSpec := map[string]any{"nodeSelector": map[string]any{captureDisabled: disabled}}
+	gates := make([]map[string]string, 0, len(ds.Spec.Template.Spec.SchedulingGates))
+	legacy := false
 	for _, gate := range ds.Spec.Template.Spec.SchedulingGates {
-		if gate.Name != captureGate {
+		if gate.Name == captureGate {
+			legacy = true
+		} else {
 			gates = append(gates, map[string]string{"name": gate.Name})
 		}
 	}
-	if stopped {
-		gates = append(gates, map[string]string{"name": captureGate})
+	if legacy {
+		podSpec["schedulingGates"] = gates
 	}
-	body, _ := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": annotations}, "spec": map[string]any{"template": map[string]any{"spec": map[string]any{"schedulingGates": gates}}}})
+	metadata := map[string]any{"annotations": annotations}
+	if ds.Metadata.ResourceVersion != "" {
+		// Protect the read/modify/write of the legacy gate list against other writers.
+		metadata["resourceVersion"] = ds.Metadata.ResourceVersion
+	}
+	body, _ := json.Marshal(map[string]any{"metadata": metadata, "spec": map[string]any{"template": map[string]any{"spec": podSpec}}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, m.api+"/apis/apps/v1/namespaces/"+m.namespace+"/daemonsets/"+m.name, bytes.NewReader(body))
 	if err != nil {
 		return err

@@ -26,15 +26,6 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: k8shark-worker
-  {{- if .Values.capture.onDemand.enabled }}
-  # A stopped revision must replace every old worker, not stall after one
-  # unavailable pod behind the scheduling gate. This setting is scoped to the
-  # opt-in lifecycle mode; normal DaemonSet rollouts retain Kubernetes defaults.
-  updateStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 100%
-  {{- end }}
   template:
     metadata:
       labels:
@@ -47,12 +38,6 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      {{- if .Values.capture.onDemand.enabled }}
-      # The hub owns only this gate at runtime. It blocks new scheduling while
-      # leaving node selectors, affinity and tolerations untouched.
-      schedulingGates:
-        - name: k8shark.io/capture-stopped
-      {{- end }}
       serviceAccountName: k8shark-worker
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -197,9 +182,18 @@ spec:
               - { key: ca.crt, path: ca.crt }
         {{- end }}
       {{- end }}
-      {{- with .Values.worker.nodeSelector }}
+      {{- if hasKey .Values.worker.nodeSelector "k8shark.io/capture-disabled" }}
+      {{- fail "worker.nodeSelector: k8shark.io/capture-disabled is reserved for capture sessions; never label nodes with this key" }}
+      {{- end }}
+      {{- if or .Values.capture.onDemand.enabled .Values.worker.nodeSelector }}
       nodeSelector:
+        {{- with .Values.worker.nodeSelector }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.capture.onDemand.enabled }}
+        # Reserved key: no node must carry this label. The hub removes it on Start.
+        k8shark.io/capture-disabled: "true"
+        {{- end }}
       {{- end }}
       {{- with .Values.worker.affinity }}
       affinity:
