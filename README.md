@@ -170,14 +170,28 @@ ignoreDifferences:
   - group: apps
     kind: DaemonSet
     name: k8shark-worker
+    namespace: k8shark
     jqPathExpressions:
       - .metadata.annotations["k8shark.io/capture-state"]
       - .metadata.annotations["k8shark.io/capture-expiry"]
-      - .spec.template.spec.schedulingGates[] | select(.name == "k8shark.io/capture-stopped")
+      - .spec.template.spec.nodeSelector["k8shark.io/capture-disabled"]
 syncPolicy:
   syncOptions:
     - RespectIgnoreDifferences=true
 ```
+
+Stopping adds the reserved `k8shark.io/capture-disabled: "true"` node selector;
+starting removes only that key. Never apply this label to nodes or configure it
+in `worker.nodeSelector`. A stopped DaemonSet targets zero nodes, so Kubernetes
+removes worker pods and standard Argo CD health checks remain usable.
+
+When upgrading from scheduling gates, the hub removes only the legacy
+`k8shark.io/capture-stopped` gate and preserves an active session's expiry.
+Update the Application (or its generating ApplicationSet) exclusions before
+rolling out the new hub/chart. During migration, retain the old gate exclusion
+as well; remove it after all installations use the selector. Update any plain
+manifests too. Do not roll back only the hub image: restore the old manifests
+and gate-based ownership rules together, with capture stopped.
 
 Do not ignore the whole pod specification: image, resources, and all other
 Helm scheduling configuration remain GitOps-managed.
