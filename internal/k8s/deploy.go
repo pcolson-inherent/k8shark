@@ -103,57 +103,21 @@ func Install(ctx context.Context, log *slog.Logger, release, namespace string, s
 	return run(ctx, log, "helm", args...)
 }
 
-// Uninstall removes the release, then the namespace — unless keepNamespace is
-// set or the namespace holds resources k8shark didn't create. ensureNamespace
-// (see Install) applies k8shark's PSA labels with `kubectl apply` even to a
-// namespace that already existed, so the presence of those labels alone can't
-// tell "k8shark's own namespace" apart from "a shared namespace k8shark was
-// installed into" — `tap -n monitoring` must not delete `monitoring` and
-// everything else running in it. Checking for foreign resources instead is a
-// real (if best-effort) safety net for that case.
-func Uninstall(ctx context.Context, log *slog.Logger, release, namespace string, keepNamespace bool) error {
-	_ = run(ctx, log, "helm", "uninstall", release, "--namespace", namespace)
-	if keepNamespace {
-		log.Info("keeping namespace (--keep-namespace)", "namespace", namespace)
+// Uninstall removes the release and keeps its namespace unless deleteNamespace
+// is explicitly requested by the caller.
+func Uninstall(ctx context.Context, log *slog.Logger, release, namespace string, deleteNamespace bool) error {
+	if err := run(ctx, log, "helm", "uninstall", release, "--namespace", namespace); err != nil {
+		return err
+	}
+	if !deleteNamespace {
+		log.Info("keeping namespace", "namespace", namespace)
 		return nil
 	}
-	foreign, err := namespaceHasForeignResources(ctx, namespace)
-	if err != nil {
-		log.Warn("could not verify the namespace is safe to delete, leaving it in place",
-			"namespace", namespace, "err", err,
-			"hint", "delete it yourself with kubectl if that's safe, or re-run with --keep-namespace to silence this")
-		return nil
-	}
-	if foreign {
-		log.Warn("namespace has resources k8shark did not create, leaving it in place",
-			"namespace", namespace,
-			"hint", "remove the unrelated resources and re-run clean, or pass --keep-namespace to always skip this")
-		return nil
-	}
+	// Neither PSA labels nor `kubectl get all` establish namespace ownership:
+	// Install also labels pre-existing namespaces, and get all omits many kinds.
+	// This explicit opt-in deletes everything, including unrelated resources.
+	log.Warn("deleting entire namespace and ALL remaining resources (--delete-namespace)", "namespace", namespace)
 	return run(ctx, log, "kubectl", "delete", "namespace", namespace, "--ignore-not-found")
-}
-
-// namespaceHasForeignResources reports whether namespace contains any of the
-// common workload/networking kinds (`kubectl get all`) NOT carrying
-// k8shark's app.kubernetes.io/part-of label — i.e. something k8shark didn't
-// put there itself. This is best-effort, not exhaustive (bare ConfigMaps,
-// Secrets and PVCs from another tool would slip through), so it's a safety
-// net layered on top of --keep-namespace, not a substitute for it. A
-// not-found namespace (already gone) is reported as having nothing foreign,
-// since there's nothing left to protect.
-func namespaceHasForeignResources(ctx context.Context, namespace string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "kubectl", "get", "all",
-		"--namespace", namespace,
-		"-l", "app.kubernetes.io/part-of!=k8shark",
-		"-o", "name")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if strings.Contains(string(out), "NotFound") {
-			return false, nil
-		}
-		return false, fmt.Errorf("kubectl get all -n %s: %w: %s", namespace, err, strings.TrimSpace(string(out)))
-	}
-	return len(strings.TrimSpace(string(out))) > 0, nil
 }
 
 // PortForward starts `kubectl port-forward` for a service. The returned command

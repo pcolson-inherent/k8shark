@@ -407,12 +407,28 @@ func redactSensitiveRedisArgs(args []string) (out []string, ok bool) {
 		}
 		return args, false
 	case "CONFIG":
-		if len(args) >= 4 && strings.EqualFold(args[1], "SET") &&
-			(strings.EqualFold(args[2], "requirepass") || strings.EqualFold(args[2], "masterauth")) {
+		if !strings.EqualFold(args[1], "SET") {
+			return args, false
+		}
+		if (len(args)-2)%2 != 0 {
+			// Incomplete pairs have no reliable parameter/value boundary.
 			out = append([]string(nil), args...)
-			for i := 3; i < len(out); i++ {
+			for i := 2; i < len(out); i++ {
 				out[i] = redactedValue
 			}
+			return out, true
+		}
+		for i := 2; i+1 < len(args); i += 2 {
+			if !strings.EqualFold(args[i], "requirepass") && !strings.EqualFold(args[i], "masterauth") {
+				continue
+			}
+			if !ok {
+				out = append([]string(nil), args...)
+				ok = true
+			}
+			out[i+1] = redactedValue
+		}
+		if ok {
 			return out, true
 		}
 	}

@@ -488,11 +488,26 @@ func (p *pipeline) consumeStream(netFlow, transport gopacket.Flow, r io.Reader) 
 	// answer, not the eBPF TLS scheduling race, so it must not sleep on it.
 	p.addAFPacketStream(key)
 	defer p.removeAFPacketStream(key)
+	// A parser can stop before EOF (e.g. malformed HTTP). Keep acknowledging
+	// the underlying reassembler, including after DataLost, so one bad flow
+	// cannot block capture of every other connection.
+	defer drainTCPStream(r)
 	lr := &lossReader{r: r, onLoss: func() {
 		p.purgePending(key)
 		p.sink.tcpLossEvents.Add(1)
 	}}
 	p.consumeStreamID(c, lr)
+}
+
+// Use a private buffer: multiple abandoned streams can drain concurrently.
+func drainTCPStream(r io.Reader) {
+	var buf [4096]byte
+	for {
+		_, err := r.Read(buf[:])
+		if err != nil && !errors.Is(err, tcpreader.DataLost) {
+			return
+		}
+	}
 }
 
 // lossReader wraps an AF_PACKET tcpreader.ReaderStream (with LossErrors
@@ -1555,7 +1570,10 @@ func parseQuery(u *url.URL, redact bool) map[string]string {
 	if u == nil || u.RawQuery == "" {
 		return nil
 	}
-	q := u.Query()
+	q, err := url.ParseQuery(u.RawQuery)
+	if redact && err != nil {
+		return nil // do not expose a partial parse of a malformed query
+	}
 	if len(q) == 0 {
 		return nil
 	}
@@ -1581,8 +1599,8 @@ func redactedRequestURI(u *url.URL, redact bool) string {
 	if !redact || u.RawQuery == "" {
 		return u.RequestURI()
 	}
-	q := u.Query()
-	changed := false
+	q, err := url.ParseQuery(u.RawQuery)
+	changed := err != nil // malformed input must never fall back to the raw URI
 	for k := range q {
 		if sensitiveQueryParams[strings.ToLower(k)] {
 			q[k] = []string{redactedValue}
@@ -1595,6 +1613,9 @@ func redactedRequestURI(u *url.URL, redact bool) string {
 	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
+	}
+	if err != nil {
+		return path + "?" + url.QueryEscape(redactedValue)
 	}
 	return path + "?" + q.Encode()
 }

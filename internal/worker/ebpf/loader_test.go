@@ -161,10 +161,10 @@ func TestDecodeEventLaggedTombstone(t *testing.T) {
 func TestLossMarkerRetriesFullQueueAndSuppressesTail(t *testing.T) {
 	out := make(chan TLSRecord, 1)
 	out <- TLSRecord{ConnID: 99}
-	lagged := map[uint64]bool{}
+	lagged := map[TLSConnKey]bool{}
 	ev := TLSRecord{ConnID: 42, Data: []byte("must not reach parser")}
 	forwardLoss(out, lagged, ev)
-	if sent, ok := lagged[42]; !ok || sent {
+	if sent, ok := lagged[ev.ConnectionKey()]; !ok || sent {
 		t.Fatal("full queue must leave loss marker pending")
 	}
 	<-out
@@ -176,6 +176,35 @@ func TestLossMarkerRetriesFullQueueAndSuppressesTail(t *testing.T) {
 	forwardLoss(out, lagged, ev)
 	if len(out) != 0 {
 		t.Fatal("tail forwarded after delivered loss marker")
+	}
+}
+
+func TestLossMarkersSeparateProcessesSharingSSLPointer(t *testing.T) {
+	out := make(chan TLSRecord, 1)
+	lagged := map[TLSConnKey]bool{}
+	first := TLSRecord{PID: 101, TID: 7, ConnID: 42, Data: []byte("first")}
+	second := TLSRecord{PID: 202, TID: 9, ConnID: 42, Data: []byte("second")}
+	forwardLoss(out, lagged, first)
+	// The full queue must leave the second process's marker pending,
+	// independently of the first process's already-delivered marker.
+	forwardLoss(out, lagged, second)
+	marker := <-out
+	if !marker.Lagged || marker.PID != first.PID || marker.ConnID != first.ConnID || len(marker.Data) != 0 {
+		t.Fatalf("invalid first marker: %+v", marker)
+	}
+	second.TID++ // A connection may move between threads in the same process.
+	forwardLoss(out, lagged, second)
+	if len(out) != 1 {
+		t.Fatal("second process's loss marker was suppressed by the first process's SSL pointer")
+	}
+	marker = <-out
+	if !marker.Lagged || marker.PID != second.PID || marker.ConnID != second.ConnID || len(marker.Data) != 0 {
+		t.Fatalf("invalid second marker: %+v", marker)
+	}
+	forwardLoss(out, lagged, first)
+	forwardLoss(out, lagged, second)
+	if len(out) != 0 {
+		t.Fatal("tail forwarded after a process's loss marker was delivered")
 	}
 }
 
