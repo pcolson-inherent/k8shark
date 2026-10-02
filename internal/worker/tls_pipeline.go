@@ -113,7 +113,7 @@ func (p *pipeline) consumeTLS(ctx context.Context, src ebpf.Source) {
 }
 
 func (p *pipeline) consumeTLSBounded(ctx context.Context, src ebpf.Source, streamLimit int, budget *tlsByteBudget) {
-	streams := map[uint64]*tlsStream{}
+	streams := map[ebpf.TLSConnKey]*tlsStream{}
 	gc := time.NewTicker(15 * time.Second)
 	defer gc.Stop()
 	closeAll := func() {
@@ -139,13 +139,14 @@ func (p *pipeline) consumeTLSBounded(ctx context.Context, src ebpf.Source, strea
 				closeAll()
 				return
 			}
+			key := rec.ConnectionKey()
 			if rec.Lagged {
 				// Backpressure dropped an interior chunk of this connection
 				// upstream (see ebpf loader drainLoop): close the stream so
 				// its dissectors see a clean truncation instead of a hole.
-				if st := streams[rec.ConnID]; st != nil {
+				if st := streams[key]; st != nil {
 					st.close()
-					delete(streams, rec.ConnID)
+					delete(streams, key)
 					p.sink.tlsLagDrops.Add(1)
 				}
 				continue
@@ -153,14 +154,14 @@ func (p *pipeline) consumeTLSBounded(ctx context.Context, src ebpf.Source, strea
 			if p.sink.paused() {
 				continue // hub told this worker to stop turning capture into entries
 			}
-			st := streams[rec.ConnID]
+			st := streams[key]
 			if st == nil {
 				if len(streams) >= streamLimit {
 					p.sink.tlsBudgetDrops.Add(1)
 					continue
 				}
 				st = newTLSStream(p, rec, budget)
-				streams[rec.ConnID] = st
+				streams[key] = st
 			}
 			st.lastSeen = time.Now()
 			st.feed(rec)

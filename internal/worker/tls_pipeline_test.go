@@ -322,7 +322,7 @@ func TestConsumeTLSLaggedTombstone(t *testing.T) {
 	// truncated stream, and the lag counter must tick.
 	src.ch <- ebpf.TLSRecord{PID: 1, TID: 7, ConnID: 42, Direction: ebpf.TLSDirWrite,
 		Data: []byte("GET /partial HTTP/1.1\r\nHost: e")}
-	src.ch <- ebpf.TLSRecord{ConnID: 42, Lagged: true}
+	src.ch <- ebpf.TLSRecord{PID: 1, ConnID: 42, Lagged: true}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && s.tlsLagDrops.Load() == 0 {

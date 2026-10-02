@@ -47,14 +47,21 @@ const (
 	TLSDirRead
 )
 
+// TLSConnKey identifies an SSL* pointer within its process. The pointer alone
+// is not unique across processes; TID is not part of a connection's identity.
+type TLSConnKey struct {
+	PID    uint32
+	ConnID uint64
+}
+
 // TLSRecord is one plaintext buffer captured at a TLS library boundary.
 //
 // ConnID is a synthetic identity derived from the SSL* pointer (unique per
 // TLS connection in a process), used to fan the two directions of one
-// connection together. SrcIP/DstIP/SrcPort/DstPort carry the real 4-tuple
-// once the tcp_sendmsg/tcp_recvmsg kprobes have resolved this thread's socket
-// (Phase 2b); until then (or for IPv6, not yet resolved) they are empty/zero
-// and the consumer falls back to a pid:<n> endpoint.
+// connection together, always keyed with PID. SrcIP/DstIP/SrcPort/DstPort
+// carry the real 4-tuple once the tcp_sendmsg/tcp_recvmsg kprobes have resolved
+// this thread's socket (Phase 2b); until then they are empty/zero and the
+// consumer falls back to a pid:<n> endpoint.
 type TLSRecord struct {
 	PID, TID  uint32
 	ConnID    uint64
@@ -71,8 +78,13 @@ type TLSRecord struct {
 	// of this connection's interior chunks, so the byte stream has a hole the
 	// parser must never see. The consumer closes the stream with a clean
 	// truncation (exactly chanPipe's own lag policy); no further records for
-	// this ConnID will follow.
+	// this (PID, ConnID) will follow.
 	Lagged bool
+}
+
+// ConnectionKey scopes the SSL pointer to its PID, including PID zero in fixtures.
+func (r TLSRecord) ConnectionKey() TLSConnKey {
+	return TLSConnKey{PID: r.PID, ConnID: r.ConnID}
 }
 
 // Config configures a Source.

@@ -134,7 +134,10 @@ func probeNames(objs *tlsObjects) map[string]*cebpf.Program {
 type linuxSource struct {
 	cfg  Config
 	objs tlsObjects
-	rd   *ringbuf.Reader
+	rd   interface {
+		Read() (ringbuf.Record, error)
+		Close() error
+	}
 
 	out chan TLSRecord
 
@@ -215,42 +218,42 @@ func (s *linuxSource) Attach() error {
 	return nil
 }
 
-// maxLaggedConns bounds drainLoop's lagged-connection set. There is no
-// connection-close event to prune on, so on overflow the set is cleared —
-// the worst case is a pruned connection getting a second tombstone or a
-// stale one resuming misparsed, both strictly better than unbounded growth.
+// maxLaggedConns bounds drainLoop's loss ledger. Without connection-close
+// events no entry can safely be pruned: saturation stops capture until restart.
 const maxLaggedConns = 4096
 
 // A full output channel must leave the tombstone pending for the next event.
-func forwardLoss(out chan TLSRecord, lagged map[uint64]bool, ev TLSRecord) {
-	if lagged[ev.ConnID] {
+func forwardLoss(out chan TLSRecord, lagged map[TLSConnKey]bool, ev TLSRecord) {
+	key := ev.ConnectionKey()
+	if lagged[key] {
 		return
 	}
 	ev.Data = nil
 	ev.Lagged = true
-	lagged[ev.ConnID] = false
+	lagged[key] = false
 	select {
 	case out <- ev:
-		lagged[ev.ConnID] = true
+		lagged[key] = true
 	default:
 	}
 }
 
-// drainLoop copies ring buffer records into s.out. On backpressure it drops
-// the oldest buffered record — but that record is an interior chunk of some
-// connection's byte stream, exactly the mid-stream hole chanPipe
-// (tls_pipeline.go) refuses to create because it desyncs the parser for the
-// rest of the connection. So the victim's ConnID is marked lagged: its
-// remaining records are discarded and a single data-less Lagged tombstone is
-// forwarded instead, telling the consumer to close that stream with a clean
-// truncation. Consistent with sink.emit's drop-newest-not-block policy in
-// spirit: a stalled consumer never blocks uprobe delivery or grows memory.
+func (s *linuxSource) stopOnLedgerOverflow(size int) {
+	s.cfg.Log.Error("ebpf: lagged-connection ledger saturated; stopping TLS source until restart", "size", size)
+	// Close waits for drainLoop's WaitGroup; never call it inline from there.
+	go s.Close()
+}
+
+// drainLoop drops the newest record on backpressure, keeping queued prefixes
+// and tombstones intact even at shutdown. The dropped record's connection is
+// marked lagged: suppress its tail and retry a data-less truncation tombstone.
+// A full loss ledger stops the source instead of forgetting a known byte hole.
 func (s *linuxSource) drainLoop() {
 	defer s.wg.Done()
 	// lagged tracks connections that lost an interior chunk; the value is
 	// whether their tombstone has been delivered yet. Owned exclusively by
 	// this goroutine — no locking.
-	lagged := map[uint64]bool{}
+	lagged := map[TLSConnKey]bool{}
 	for {
 		rec, err := s.rd.Read()
 		if err != nil {
@@ -265,20 +268,22 @@ func (s *linuxSource) drainLoop() {
 			s.cfg.Log.Debug("ebpf: drop malformed record", "err", err)
 			continue
 		}
+		key := ev.ConnectionKey()
 		if ev.Lagged {
 			// A kernel-side read/truncation tombstone has the same semantics as
-			// a locally evicted record: forward it once, then suppress the tail
+			// a locally dropped record: forward it once, then suppress the tail
 			// so a new stream cannot be built across a known byte hole.
-			if sent, seen := lagged[ev.ConnID]; seen && sent {
+			if sent, seen := lagged[key]; seen && sent {
 				continue
 			}
-			if len(lagged) >= maxLaggedConns {
-				lagged = map[uint64]bool{}
+			if _, seen := lagged[key]; !seen && len(lagged) >= maxLaggedConns {
+				s.stopOnLedgerOverflow(len(lagged))
+				return
 			}
 			forwardLoss(s.out, lagged, ev)
 			continue
 		}
-		if sent, isLagged := lagged[ev.ConnID]; isLagged {
+		if sent, isLagged := lagged[key]; isLagged {
 			if sent {
 				continue // stream already truncated; discard the tail
 			}
@@ -290,21 +295,12 @@ func (s *linuxSource) drainLoop() {
 			continue
 		default:
 		}
-		// Channel full: evict the oldest buffered record and lag its
-		// connection (a tombstone victim just re-arms its pending state).
-		select {
-		case victim := <-s.out:
-			if len(lagged) >= maxLaggedConns {
-				s.cfg.Log.Warn("ebpf: lagged-connection set overflow, clearing", "size", len(lagged))
-				lagged = map[uint64]bool{}
-			}
-			lagged[victim.ConnID] = false
-		default:
+		if len(lagged) >= maxLaggedConns {
+			s.stopOnLedgerOverflow(len(lagged))
+			return
 		}
-		select {
-		case s.out <- ev:
-		default:
-		}
+		// Never evict a prefix or a queued loss marker to admit newer data.
+		forwardLoss(s.out, lagged, ev)
 	}
 }
 

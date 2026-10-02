@@ -70,7 +70,8 @@ make docker-buildx REGISTRY=ghcr.io/you/k8shark      # build + push both images,
 
 `tap` installs the hub, the worker DaemonSet and the front via an embedded
 Helm chart, then port-forwards the dashboard to <http://localhost:8899> and
-opens a browser. Remove everything with `k8shark clean`.
+opens a browser. Uninstall the Helm release with `k8shark clean`; the
+namespace is kept by default (see the cleanup options below).
 
 ### On a cluster, via Helm directly
 
@@ -99,13 +100,21 @@ registry/tag, plus how to wire an `imagePullSecrets` for a private registry.
 | Command | Description |
 |---------|-------------|
 | `k8shark tap` | Deploy to the cluster and open the dashboard (`--demo` for synthetic traffic, `--set` for extra Helm values). |
-| `k8shark clean` | Remove the release and namespace. |
+| `k8shark clean` | Uninstall the Helm release; keep the namespace unless `--delete-namespace` is explicitly passed. |
 | `k8shark proxy` | Port-forward the dashboard of an existing install. |
 | `k8shark console` | Stream component logs (`--component hub\|worker\|front`). |
 | `k8shark hub` | Run the hub server (used by the hub container). `--port`, `--serve-ui <dir>` for local dev. |
 | `k8shark worker` | Run the node worker (used by the worker DaemonSet). See flags below. |
 | `k8shark mcp` | Run an MCP server exposing captured traffic to AI agents (`get_stats`, `list_entries`, `get_entry`, `get_traffic_summary`, `get_timeline`, `diff_traffic`, `find_error_clusters`, `get_workers`, `list_filter_fields`, `list_namespaces`, `list_workloads`). `--hub-token` when the hub requires auth; `--print-config` prints a ready-to-paste client config block. **Setup guide: [docs/mcp.md](docs/mcp.md).** |
 | `k8shark version` | Print the version. |
+
+Cleanup keeps the namespace even with `--keep-namespace=false`; the legacy
+`--keep-namespace` flag remains accepted. **`k8shark clean --delete-namespace`
+deletes the entire namespace and ALL remaining resources**, including unrelated
+Secrets, PVCs, ConfigMaps and custom resources. Use it only when you intend that
+full deletion: namespace/PSA labels and `kubectl get all` do not prove exclusive
+ownership. It cannot be combined with `--keep-namespace=true`. If Helm uninstall
+fails, `clean` returns the error and never attempts namespace deletion.
 
 Worker flags of note: `--demo` / `--demo-rps` (synthetic traffic, opt-in
 only), `--redis-ports` / `--valkey-ports` / `--amqp-ports` (extra ports for
